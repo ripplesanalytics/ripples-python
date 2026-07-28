@@ -7,7 +7,99 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ripples import Ripples, RipplesError
+from ripples import (
+    VISITOR_COOKIE,
+    Ripples,
+    RipplesError,
+    set_visitor_id,
+    visitor_id_from_cookies,
+)
+
+VID = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+
+
+class TestVisitorId:
+    def setup_method(self):
+        self.ripples = Ripples("priv_test")
+        set_visitor_id(None)
+
+    def teardown_method(self):
+        set_visitor_id(None)
+
+    def test_omitted_when_nothing_is_bound(self):
+        """No visitor anywhere: the key is absent so the API assigns one."""
+        self.ripples.signup("u1")
+        assert "$visitor_id" not in self.ripples._queue[0]
+
+    def test_ambient_visitor_id_is_attached_to_every_event_type(self):
+        set_visitor_id(VID)
+        self.ripples.signup("u1")
+        self.ripples.identify("u1")
+        self.ripples.track("did a thing", "u1")
+        self.ripples.revenue(9.99, "u1")
+
+        assert all(e["$visitor_id"] == VID for e in self.ripples._queue)
+
+    def test_explicit_beats_ambient_beats_pinned(self):
+        explicit = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        ambient = "11111111-2222-3333-4444-555555555555"
+
+        r = Ripples("priv_test", visitor_id=VID)
+        r.signup("u1")  # pinned only
+        set_visitor_id(ambient)
+        r.signup("u2")  # ambient wins over pinned
+        r.signup("u3", visitor_id=explicit)  # explicit wins over both
+
+        assert r._queue[0]["$visitor_id"] == VID
+        assert r._queue[1]["$visitor_id"] == ambient
+        assert r._queue[2]["$visitor_id"] == explicit
+
+    def test_malformed_visitor_id_is_dropped_rather_than_forwarded(self):
+        for bad in ("", "not-a-uuid", "../../etc/passwd", VID + "x", 12345):
+            r = Ripples("priv_test")
+            r.signup("u1", visitor_id=bad)
+            assert "$visitor_id" not in r._queue[0], f"cookie: {bad!r}"
+
+    def test_visitor_id_is_lowercased_and_trimmed(self):
+        set_visitor_id(f"  {VID.upper()}  ")
+        self.ripples.signup("u1")
+        assert self.ripples._queue[0]["$visitor_id"] == VID
+
+    def test_visitor_id_never_survives_as_a_custom_property(self):
+        self.ripples.revenue(5.0, "u1", visitor_id=VID, plan="pro")
+        event = self.ripples._queue[0]
+        assert event["$visitor_id"] == VID
+        assert "visitor_id" not in event
+        assert event["plan"] == "pro"
+
+    def test_ambient_id_does_not_leak_across_contexts(self):
+        """A ContextVar, not a global: concurrent requests must not see each
+        other's visitor."""
+        import contextvars
+
+        set_visitor_id(VID)
+
+        def other_request() -> str | None:
+            set_visitor_id("11111111-2222-3333-4444-555555555555")
+            r = Ripples("priv_test")
+            r.signup("them")
+            return r._queue[0]["$visitor_id"]
+
+        theirs = contextvars.copy_context().run(other_request)
+
+        self.ripples.signup("me")
+        assert theirs == "11111111-2222-3333-4444-555555555555"
+        assert self.ripples._queue[0]["$visitor_id"] == VID
+
+
+class TestVisitorIdFromCookies:
+    def test_reads_the_tracker_cookie(self):
+        assert visitor_id_from_cookies({VISITOR_COOKIE: VID}) == VID
+
+    def test_absent_or_malformed_cookie_yields_none(self):
+        assert visitor_id_from_cookies({}) is None
+        assert visitor_id_from_cookies({VISITOR_COOKIE: ""}) is None
+        assert visitor_id_from_cookies({VISITOR_COOKIE: "garbage"}) is None
 
 
 class TestInit:
@@ -43,39 +135,39 @@ class TestEnqueue:
         self.ripples.revenue(49.99, "user_1", currency="EUR")
         assert len(self.ripples._queue) == 1
         event = self.ripples._queue[0]
-        assert event["type"] == "revenue"
-        assert event["amount"] == 49.99
-        assert event["user_id"] == "user_1"
+        assert event["$type"] == "revenue"
+        assert event["$amount"] == 49.99
+        assert event["$user_id"] == "user_1"
         assert event["currency"] == "EUR"
-        assert "sent_at" in event
+        assert "$sent_at" in event
 
     def test_signup_enqueues(self):
         self.ripples.signup("user_1", email="jane@example.com")
         event = self.ripples._queue[0]
-        assert event["type"] == "signup"
-        assert event["user_id"] == "user_1"
+        assert event["$type"] == "signup"
+        assert event["$user_id"] == "user_1"
         assert event["email"] == "jane@example.com"
 
     def test_track_enqueues(self):
         self.ripples.track("created a budget", "user_1", area="budgets")
         event = self.ripples._queue[0]
-        assert event["type"] == "track"
-        assert event["name"] == "created a budget"
-        assert event["user_id"] == "user_1"
-        assert event["area"] == "budgets"
+        assert event["$type"] == "track"
+        assert event["$name"] == "created a budget"
+        assert event["$user_id"] == "user_1"
+        assert event["$area"] == "budgets"
 
     def test_identify_enqueues(self):
         self.ripples.identify("user_1", email="jane@example.com", role="admin")
         event = self.ripples._queue[0]
-        assert event["type"] == "identify"
-        assert event["user_id"] == "user_1"
+        assert event["$type"] == "identify"
+        assert event["$user_id"] == "user_1"
         assert event["email"] == "jane@example.com"
         assert event["role"] == "admin"
 
     def test_negative_revenue_for_refunds(self):
         self.ripples.revenue(-29.99, "user_1", transaction_id="txn_abc")
         event = self.ripples._queue[0]
-        assert event["amount"] == -29.99
+        assert event["$amount"] == -29.99
 
 
 class TestFlush:

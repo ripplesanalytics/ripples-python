@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import atexit
 import os
+import re
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import requests
 
@@ -15,6 +17,54 @@ try:
     SDK_VERSION = _pkg_version("ripples")
 except PackageNotFoundError:
     SDK_VERSION = "0.0.0"
+
+#: First-party cookie the browser tracker writes on every pageview.
+VISITOR_COOKIE = "_rpl_vid"
+
+_UUID_RE = re.compile(r"^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$", re.IGNORECASE)
+
+# A ContextVar rather than a module global: the client is normally a singleton
+# shared by every worker thread and every concurrent coroutine, so a plain
+# attribute would leak one request's visitor onto another request's events.
+_ambient_visitor_id: ContextVar[str | None] = ContextVar(
+    "ripples_visitor_id", default=None
+)
+
+
+def _normalize_visitor_id(value: Any) -> str | None:
+    """Drop anything that isn't a well-formed UUID.
+
+    Cookies are user-controlled and `visitor_id` is a UUID column at the other
+    end, so a hand-edited value would fail the insert for the whole batch.
+    """
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value.lower() if _UUID_RE.match(value) else None
+
+
+def visitor_id_from_cookies(cookies: Mapping[str, str]) -> str | None:
+    """Pull the tracker's visitor id out of a request's cookies.
+
+    Works with anything dict-like: Django's ``request.COOKIES``, Flask's and
+    FastAPI's ``request.cookies``. Returns None when the cookie is absent or
+    malformed, which is the signal to let the API assign an id instead.
+    """
+    return _normalize_visitor_id(cookies.get(VISITOR_COOKIE))
+
+
+def set_visitor_id(visitor_id: str | None) -> None:
+    """Bind the browser visitor that events on this request belong to.
+
+    Call it once where you already have the request, before any signup/track
+    call in the same view or coroutine::
+
+        ripples.set_visitor_id(ripples.visitor_id_from_cookies(request.COOKIES))
+
+    Without it, a server-side signup lands on a synthetic per-user id and its
+    acquisition channel is only recoverable once the browser identifies.
+    """
+    _ambient_visitor_id.set(_normalize_visitor_id(visitor_id))
 
 
 def _format_timestamp(ts: datetime | str | None) -> str:
@@ -51,6 +101,7 @@ class Ripples:
         connect_timeout: int = 2,
         on_error: Callable[[Exception], None] | None = None,
         max_queue_size: int = 100,
+        visitor_id: str | None = None,
     ) -> None:
         self._secret_key = secret_key or os.environ.get("RIPPLES_SECRET_KEY", "")
         if not self._secret_key:
@@ -66,6 +117,9 @@ class Ripples:
         self._timeout = (connect_timeout, timeout)
         self._on_error = on_error
         self._max_queue_size = max_queue_size
+        # A static default for single-visitor processes; set_visitor_id() binds
+        # per request and takes precedence over it.
+        self._visitor_id = _normalize_visitor_id(visitor_id)
         self._queue: list[dict[str, Any]] = []
 
         self._session = requests.Session()
@@ -110,6 +164,11 @@ class Ripples:
         **attributes: Any,
     ) -> None:
         """Track a signup.
+
+        Bind the request's visitor first — via set_visitor_id() or a
+        visitor_id= keyword — and the signup keeps the acquisition channel of
+        the browsing session that produced it. Without one it still works, but
+        the channel is only recoverable once the browser identifies.
 
         Pass timestamp= to backfill a historical event; omit for "now".
         """
@@ -228,16 +287,31 @@ class Ripples:
         *,
         timestamp: datetime | str | None = None,
     ) -> None:
-        self._queue.append(
-            {
-                **data,
-                "$type": event_type,
-                "$sent_at": _format_timestamp(timestamp),
-                "$sdk_name": SDK_NAME,
-                "$sdk_version": SDK_VERSION,
-                "$platform": "server",
-            }
+        # An explicit visitor_id= on the call beats the one bound to this
+        # request, which beats the client's pinned default. Pop both spellings
+        # unconditionally so neither survives as a custom property.
+        unprefixed = data.pop("visitor_id", None)
+        prefixed = data.pop("$visitor_id", None)
+        visitor_id = _normalize_visitor_id(
+            prefixed or unprefixed or _ambient_visitor_id.get() or self._visitor_id
         )
+
+        event = {
+            **data,
+            "$type": event_type,
+            "$sent_at": _format_timestamp(timestamp),
+            "$sdk_name": SDK_NAME,
+            "$sdk_version": SDK_VERSION,
+            "$platform": "server",
+        }
+
+        # Omit the key entirely when there is no visitor — the API then mints a
+        # stable per-user id of its own, exactly as it did before this existed.
+        # Sending "" instead would be read as a real id and break that fallback.
+        if visitor_id is not None:
+            event["$visitor_id"] = visitor_id
+
+        self._queue.append(event)
         if len(self._queue) >= self._max_queue_size:
             self.flush()
 
